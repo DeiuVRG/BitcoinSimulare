@@ -61,8 +61,9 @@ elif "Time Series (Digital Currency Daily)" in response_json:
 else:
     print("Nu s-au găsit date pentru simbolul specificat. Structura răspunsului:", response_json)
 
-# Numele fișierului de export
-file_name = "bitcoin_daily_price_history.xlsx"
+# Numele fișierului de export în locația scriptului
+script_dir = os.path.dirname(os.path.abspath(__file__))  # Obținem locația scriptului
+file_name = os.path.join(script_dir, "bitcoin_daily_price_history.xlsx")
 
 # Ștergem fișierul existent, dacă există
 if os.path.exists(file_name):

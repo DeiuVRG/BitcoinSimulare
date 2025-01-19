@@ -1,91 +1,152 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import mplcursors  # Importăm mplcursors pentru interacțiune
-from statsmodels.tsa.statespace.sarimax import SARIMAX
-from arch import arch_model
-import warnings
+import os
+from statsmodels.tsa.arima.model import ARIMA
+import mplcursors
+from matplotlib.dates import num2date  # <--- pentru conversie x_val -> datetime
 
-# Dezactivăm avertismentele pentru a preveni interferențele
-warnings.filterwarnings("ignore")
+# ----------------------------------------------------------------------------
+# 1) Citește fișierul Excel cu date istorice BTC
+# ----------------------------------------------------------------------------
+script_dir = os.path.dirname(os.path.abspath(__file__))
+file_name = os.path.join(script_dir, "bitcoin_daily_price_history.xlsx")
 
-# Citire date din fișierul Excel
-file_path = r"C:\Users\uig21225\OneDrive - Continental AG\AUTOMATIZARE\bitcoin_daily_price_history.xlsx"
-data = pd.read_excel(file_path)
-data['Date'] = pd.to_datetime(data['Date'])
-data.set_index('Date', inplace=True)
-data = data.sort_index()
+if not os.path.exists(file_name):
+    print(f"Fișierul {file_name} nu există. Rulează mai întâi scriptul de extragere a datelor.")
+    exit()
 
-# Folosim coloana 'Close' pentru analiză
-price_data = data['Close'] / 1e6  # Scalează datele pentru stabilitate
+df = pd.read_excel(file_name)
 
-# Definim perioada de forecast
-forecast_days = 30
+# Convertim coloana Date în datetime și o setăm ca index
+df['Date'] = pd.to_datetime(df['Date'])
+df.set_index('Date', inplace=True)
+df.sort_index(inplace=True)
 
-# Modelul SARIMA cu parametri ajustați
-sarima_model = SARIMAX(price_data, order=(1, 1, 1), seasonal_order=(1, 0, 1, 7))
-sarima_fit = sarima_model.fit(disp=False)
+# ----------------------------------------------------------------------------
+# 2) Calculăm log-return 
+# ----------------------------------------------------------------------------
+df['log_price'] = np.log(df['Close'])
+df['log_return'] = df['log_price'].diff()
+df.dropna(subset=['log_return'], inplace=True)  # eliminăm primul NaN
 
-# Extragem reziduurile și aplicăm modelul GARCH pentru volatilitate
-sarima_residuals = sarima_fit.resid
-garch_model = arch_model(sarima_residuals, vol='Garch', p=1, q=1, rescale=False)
-garch_fit = garch_model.fit(disp='off')
+# ----------------------------------------------------------------------------
+# 3) Antrenăm un model ARIMA pe log_return
+# ----------------------------------------------------------------------------
+p, d, q = 1, 0, 1
+model = ARIMA(df['log_return'], order=(p, d, q))
+fit = model.fit()
 
-# Ultima valoare reală din datele istorice
-last_historical_value = price_data.iloc[-1] * 1e6
+print(f"Rezumat ARIMA({p},{d},{q}):")
+print(fit.summary())
 
-# Funcția de simulare Monte Carlo pentru predicție
-def monte_carlo_simulation(base_forecast, garch_fit, num_simulations=1000, forecast_days=30, variance=0.005):
-    simulations = []
-    garch_volatility = garch_fit.forecast(horizon=forecast_days).variance.values[-1, :]
+# ----------------------------------------------------------------------------
+# 4) Forecast randamente + simulare Monte Carlo
+# ----------------------------------------------------------------------------
+forecast_days = 20            # zile forecast
+num_simulations = 15000     # !!! foarte mare => atenție la timpul de rulare
+volatility_factor = 3.0       # crește factorul de volatilitate (ex. 2.0)
+
+# Forecastul ARIMA (randamente medii prezise)
+forecast_obj = fit.get_forecast(steps=forecast_days)
+mean_returns_forecast = forecast_obj.predicted_mean
+
+# Reziduurile modelului
+residuals = fit.resid.dropna()
+
+# Ultimul preț logaritmic din date
+last_log_price = df['log_price'].iloc[-1]
+
+# Simulările (log-price)
+simulations_log_prices = []
+
+print(f"\n=== Încep simulările Monte Carlo: {num_simulations} simulări, "
+      f"volatility_factor={volatility_factor} ===\n"
+      "Pot dura câteva minute (sau zeci de minute), te rog așteaptă...")
+
+for _ in range(num_simulations):
+    sim_log_path = [last_log_price]
     
-    # Trend aleatoriu redus pentru a diminua zgomotul
-    random_trend = np.linspace(-0.05, 0.05, forecast_days) + np.random.normal(0, 0.01, forecast_days)
+    for day in range(forecast_days):
+        mu_t = mean_returns_forecast.iloc[day]
+        
+        # extragem un șoc normal cu sigma = dev std al reziduurilor
+        shock_raw = np.random.normal(0, np.std(residuals))
+        
+        # amplificăm șocul
+        shock = shock_raw * volatility_factor
+        
+        # randament simulat = medie + șoc
+        simulated_return = mu_t + shock
+        
+        new_log_price = sim_log_path[-1] + simulated_return
+        sim_log_path.append(new_log_price)
     
-    for _ in range(num_simulations):
-        shocks = np.random.normal(0, np.sqrt(garch_volatility) * variance, forecast_days)
-        simulated_forecast = base_forecast * (1 + random_trend + shocks)
-        simulations.append(simulated_forecast)
-    return simulations
+    simulations_log_prices.append(sim_log_path)
 
-# Predicțiile pentru următoarele 30 de zile și ajustare
-sarima_forecast = sarima_fit.get_forecast(steps=forecast_days).predicted_mean
-sarima_forecast_adjusted = sarima_forecast * (last_historical_value / sarima_forecast.iloc[0])  # Ajustăm să pornească exact de la ultima valoare
+print("Simulările s-au terminat.\n")
 
-# Simulările Monte Carlo bazate pe predicția ajustată
-sarima_simulations = monte_carlo_simulation(sarima_forecast_adjusted.values, garch_fit, forecast_days=forecast_days)
+simulations_log_prices = np.array(simulations_log_prices)  # (num_sim, forecast_days+1)
+simulations_prices = np.exp(simulations_log_prices)
 
-# Calculăm mediana și intervalele de confidență (2.5% și 97.5%) pentru simulările ajustate
-forecast_median = np.median(sarima_simulations, axis=0)
-forecast_lower = np.percentile(sarima_simulations, 2.5, axis=0)
-forecast_upper = np.percentile(sarima_simulations, 97.5, axis=0)
+# ----------------------------------------------------------------------------
+# 5) Calculăm mediană și percentila 25-75 
+# ----------------------------------------------------------------------------
+median_price = np.median(simulations_prices, axis=0)
+p25_price = np.percentile(simulations_prices, 25, axis=0)
+p75_price = np.percentile(simulations_prices, 75, axis=0)
 
-# Aplicăm un factor de lărgire pentru a mări vizibilitatea intervalului de confidență
-widening_factor = 1.02  # 2% lărgire
-forecast_lower *= widening_factor
-forecast_upper /= widening_factor
+# ----------------------------------------------------------------------------
+# 6) Construim index de timp
+# ----------------------------------------------------------------------------
+start_forecast_date = df.index[-1]  
+forecast_dates = pd.date_range(start=start_forecast_date, periods=forecast_days+1, freq='D')
 
-# Adăugăm ultima valoare din datele istorice la forecast pentru continuitate
-forecast_median = np.insert(forecast_median, 0, last_historical_value)
-forecast_lower = np.insert(forecast_lower, 0, last_historical_value)
-forecast_upper = np.insert(forecast_upper, 0, last_historical_value)
+# ----------------------------------------------------------------------------
+# 7) Plot
+# ----------------------------------------------------------------------------
+plt.figure(figsize=(10, 6))
 
-# Creăm indexul de date pentru forecast, astfel încât să includă ultima dată din datele istorice
-forecast_index = pd.date_range(price_data.index[-1], periods=forecast_days + 1)
+# Plot prețuri istorice
+line_hist, = plt.plot(df.index, df['Close'], label='Preț Istoric (Close)', color='blue')
 
-# Grafic al datelor istorice și al predicțiilor cu interval de confidență
-plt.figure(figsize=(12, 6))
-line_actual, = plt.plot(price_data * 1e6, label='Istoric Preț', color='blue')  # Rescalează înapoi pentru afișare
-line_forecast, = plt.plot(forecast_index, forecast_median, label='Predicție Mediană', color='orange')
-plt.fill_between(forecast_index, forecast_lower, forecast_upper, color='gray', alpha=0.5, label='Interval de Confidență 95%')
+# Plot mediana
+line_median, = plt.plot(forecast_dates, median_price, label='Predicție (Mediană)', color='orange')
 
-plt.xlabel('Date')
-plt.ylabel('Close Price')
+# Banda [25%, 75%]
+plt.fill_between(
+    forecast_dates,
+    p25_price,
+    p75_price,
+    color='gray',
+    alpha=0.3,
+    label='Interval [25%, 75%]'
+)
+
+plt.title(f"Predicție BTC cu ARIMA + Monte Carlo\n"
+          f"(Interval 25%-75%, {num_simulations} simulări, factor volatilitate={volatility_factor})")
+plt.xlabel("Data")
+plt.ylabel("Preț BTC (USD)")
 plt.legend()
-plt.title('Predictie Pret Bitcoin pentru urmatoarele 20 de zile (SARIMA + GARCH + Simulari Monte Carlo)')
+plt.grid(True)
+plt.tight_layout()
 
-# Adăugăm interactivitate pentru a afișa valorile la cursor
-mplcursors.cursor([line_actual, line_forecast], hover=True).connect(
-    "add", lambda sel: sel.annotation.set_text(f"{sel.target[1]:,.2f}"))
+# ----------------------------------------------------------------------------
+# 8) Interacțiune cu mouse-ul (mplcursors)
+# ----------------------------------------------------------------------------
+cursor = mplcursors.cursor([line_hist, line_median], hover=True)
 
+@cursor.connect("add")
+def on_add(sel):
+    x_val, y_val = sel.target
+    # Convertim x_val (float) în datetime prin num2date
+    date_dt = num2date(x_val)
+    date_str = date_dt.strftime('%Y-%m-%d')
+    
+    sel.annotation.set_text(f"{date_str}\nPreț: {y_val:.2f}")
+    sel.annotation.get_bbox_patch().set(fc="white", alpha=0.9)
+
+# ----------------------------------------------------------------------------
+# 9) Afișare plot interactiv
+# ----------------------------------------------------------------------------
 plt.show()
