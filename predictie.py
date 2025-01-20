@@ -44,7 +44,7 @@ print(fit.summary())
 # 4) Forecast randamente + simulare Monte Carlo
 # ----------------------------------------------------------------------------
 forecast_days = 20            # zile forecast
-num_simulations = 15000     # !!! foarte mare => atenție la timpul de rulare
+num_simulations = 150     # !!! foarte mare => atenție la timpul de rulare
 volatility_factor = 3.0       # crește factorul de volatilitate (ex. 2.0)
 
 # Forecastul ARIMA (randamente medii prezise)
